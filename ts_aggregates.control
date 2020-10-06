@@ -1,0 +1,5 @@
+comment = 'ts_aggregates:  Created by pgx'
+default_version = '1.0'
+module_pathname = '$libdir/ts_aggregates'
+relocatable = false
+superuser = false
