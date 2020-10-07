@@ -4,6 +4,8 @@ use std::{
     slice,
 };
 
+use flat_serialize::{FlatSerialize, WrapErr};
+
 use pgx::*;
 use pg_sys::{Datum, TimestampTz};
 use serde::{Serialize, Deserialize};
@@ -147,7 +149,7 @@ fn add_to_aggregate_pipeline(
 
 fn do_sample<'input>(input: TimebucketAggregate<'input>, width: i64)
 -> TimebucketAggregate<'input> {
-    let mut builder = TimebucketAggregateBuilder::with_capacity(input.times.len(), input.typ);
+    let mut builder = TimebucketAggregateBuilder::with_capacity(input.start.times.len(), *input.start.typ);
     let mut last_time = None;
     for (time, value) in input {
         let sample_time = match last_time {
@@ -171,7 +173,7 @@ fn do_sample<'input>(input: TimebucketAggregate<'input>, width: i64)
 }
 
 fn do_locf<'input>(input: TimebucketAggregate<'input>) -> TimebucketAggregate<'input> {
-    let mut builder = TimebucketAggregateBuilder::with_capacity(input.times.len(), input.typ);
+    let mut builder = TimebucketAggregateBuilder::with_capacity(input.start.times.len(), *input.start.typ);
     let mut last = None;
     for (time, mut value) in input {
         match value {
@@ -186,7 +188,7 @@ fn do_locf<'input>(input: TimebucketAggregate<'input>) -> TimebucketAggregate<'i
 fn do_linear_interpolate<'input>(input: TimebucketAggregate<'input>)
 -> TimebucketAggregate<'input> {
     //FIXME typecheck
-    let mut builder = TimebucketAggregateBuilder::with_capacity(input.times.len(), input.typ);
+    let mut builder = TimebucketAggregateBuilder::with_capacity(input.start.times.len(), *input.start.typ);
     let mut last_time;
     let mut last_value;
     let mut iter = input.into_iter();
@@ -264,7 +266,7 @@ fn unnest(
     input: Option<TimebucketAggregate<'static>>,
     typ: Option<AnyElement>,
 ) -> impl Iterator<Item=(name!(index, TimestampTz), name!(value, Option<AnyElement>))> + 'static {
-    let typ = input.as_ref().map(|i| i.typ).unwrap_or(0);
+    let typ = input.as_ref().map(|i| *i.start.typ).unwrap_or(0);
     // if let Some(input) = input {
     //     if input.typ != typ {
     //         panic!("invalid type for aggregate")
@@ -349,124 +351,66 @@ impl TimebucketAggregateBuilder {
                 self.values.len() + 1
             } as usize;
 
-        let varlen_header_size = pg_sys::VARHDRSZ;
-        let agg_header_size = size_of::<TimebucketAggregateHeader>();
-        let timestamps_size = self.values.len() * size_of::<TimestampTz>();
-        let nulls_size = num_nulls * size_of::<u64>();
-        let offsets_size = num_offsets * size_of::<u32>();
-        let data_size = unsafe {
-            let mut data_size = 0;
-            for (_, value) in &mut self.values {
-                if let Some(value) = value {
-                    if io.may_be_toasted() {
-                        let datum: Datum = *value;
-                        *value = pg_sys::pg_detoast_datum_packed(datum as *mut _) as Datum
-                    }
-                    data_size += io.get_bytes_size(*value);
-                }
-            }
-            data_size
-        };
+        let mut times = Vec::with_capacity(self.values.len());
+        let mut nulls = vec![0; num_nulls];
+        let mut value_offsets = Vec::with_capacity(num_offsets);
+        let mut values = Vec::new();
 
-        let alloc_size =
-            varlen_header_size
-            + agg_header_size
-            + timestamps_size
-            + nulls_size
-            + offsets_size
-            + data_size;
-
-        unsafe {
-            let base_ptr: *mut u8 = pg_sys::palloc0(alloc_size) as *mut u8;
-            // let header_slice = slice::from_raw_parts_mut(base_ptr as *mut u8, 4);
-            // header_slice.copy_from_slice(&((alloc_size as u32) << 2).to_ne_bytes()[..]);
-            set_varsize(base_ptr as *mut _, alloc_size as i32);
-
-            let data_ptr = base_ptr.add(varlen_header_size);
-            let data_size = alloc_size - varlen_header_size;
-            let header_ptr = data_ptr as *mut TimebucketAggregateHeader;
-            *header_ptr = TimebucketAggregateHeader {
-                typ: self.typ,
-                len: self.values.len() as u32,
-            };
-
-            let data_ptr = data_ptr.add(agg_header_size);
-            let data_size = data_size - agg_header_size;
-            let timestamps_ptr = data_ptr as *mut TimestampTz;
-            let timestamps = slice::from_raw_parts_mut(timestamps_ptr, self.values.len());
-            for (i, (timestamp, _)) in self.values.iter().enumerate() {
-                timestamps[i] = *timestamp;
-            }
-
-            let data_ptr = data_ptr.add(timestamps_size);
-            let data_size = data_size - timestamps_size;
-            let nulls_ptr = data_ptr as *mut u64;
-            let nulls = slice::from_raw_parts_mut(nulls_ptr, num_nulls);
-            for (i, (_, value)) in self.values.iter().enumerate() {
-                set_nulls_bit(nulls, i, value.is_none());
-            }
-
-            let data_ptr = data_ptr.add(nulls_size);
-            let data_size = data_size - nulls_size;
-            let offsets_ptr = data_ptr as *mut u32;
-            let offsets = slice::from_raw_parts_mut(offsets_ptr, num_offsets);
-
-
-            let data_ptr = data_ptr.add(offsets_size);
-            let data_size = data_size - offsets_size;
-            let data = slice::from_raw_parts_mut(data_ptr as *mut _, data_size);
-
-            let mut offset = 0;
-            let mut write_loc = &mut data[..];
-            for (i, (_, value)) in self.values.iter().enumerate() {
-                offsets[i] = offset;
-                match value {
-                    None => continue,
-                    Some(value) => {
-                        let (b, len) = io.write(*value, write_loc);
-                        offset += len as u32;
-                        write_loc = b;
-                    }
-                }
-            }
-
-            TimebucketAggregate {
-                base: base_ptr as *mut _,
-                typ: self.typ,
-                times: &*timestamps,
-                nulls: &*nulls,
-                value_offsets: &*offsets,
-                values: data,
-
+        let mut offset = 0;
+        for (i, (time, value)) in self.values.iter().enumerate() {
+            set_nulls_bit(&mut nulls, i, value.is_none());
+            times.push(*time);
+            value_offsets.push(offset);
+            match value {
+                None => continue,
+                Some(value) =>
+                    offset += io.write(*value, &mut values) as u32,
             }
         }
+
+        // TODO with_capacity
+        let mut bytes = Vec::new();
+        tba_start::Ref {
+            header: &0,
+            typ: &self.typ,
+            times: &*times,
+            nulls: &*nulls,
+            value_offsets: &*value_offsets,
+        }.fill_vec(&mut bytes);
+
+        bytes.append(&mut values);
+
+        unsafe {
+            set_varsize(bytes.as_mut_ptr() as *mut _, bytes.len() as i32);
+        }
+
+        let bytes = Box::leak(Vec::into_boxed_slice(bytes));
+        let (start, values) = unsafe { tba_start::try_ref(bytes).unwrap() };
+
+        TimebucketAggregate {
+            start,
+            values,
+        }
     }
-
-    // pub fn sample(&self, stepsize: i64) -> BucketedAggregate {
-    //     if self.is_empty() {
-    //         return BucketedAggregate{
-    //             start: 0,
-    //             stepsize: 0,
-    //             values: vec![],
-    //         }
-    //     }
-    //     self.sort();
-    //     let bucketed_values = vec![];
-    //     let mut current_bucket_start = None
-    //     for (time, values) in self.values {
-
-    //     }
-    // }
 }
 
-#[derive(PostgresType, Copy, Clone, Debug)]
+
+flat_serialize_macro::flat_serialize!{
+    struct tba_start {
+        header: u32,
+        typ: pg_sys::Oid,
+        len: u32,
+        times: [TimestampTz; self.len],
+        nulls: [u64; div_ceil(self.len, 64)], //TODO
+        value_offsets: [u32; self.len + self.len % 2],
+        // values: [u8], needs another step for now
+    }
+}
+
+#[derive(PostgresType, Copy, Clone)]
 #[inoutfuncs]
 pub struct TimebucketAggregate<'input>{
-    base: *mut pg_sys::varlena,
-    typ: pg_sys::Oid,
-    times: &'input [TimestampTz],
-    nulls: NullsMap<'input>,
-    value_offsets: &'input [u32],
+    start: tba_start::Ref<'input>,
     values: &'input [u8],
 }
 
@@ -484,7 +428,7 @@ impl<'input> IntoIterator for TimebucketAggregate<'input> {
         let mut typalign = 0;
         unsafe {
             pg_sys::get_typlenbyvalalign(
-                self.typ,
+                *self.start.typ,
                 &mut typlen,
                 &mut typbyval,
                 &mut typalign,
@@ -511,15 +455,15 @@ impl<'input> Iterator for AggregateIter<'input> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let idx = self.idx as usize;
-        if idx >= self.agg.times.len() {
+        if idx >= self.agg.start.times.len() {
             return None
         }
-        let time = self.agg.times[idx];
-        let is_null = get_nulls_bit(self.agg.nulls, idx);
+        let time = self.agg.start.times[idx];
+        let is_null = get_nulls_bit(self.agg.start.nulls, idx);
         let value = if is_null {
                 None
             } else {
-                let offset = self.agg.value_offsets[idx] as usize;
+                let offset = self.agg.start.value_offsets[idx] as usize;
                 let mut value_bytes = [0; size_of::<Datum>()];
                 let value_len =
                     if self.byval {
@@ -566,21 +510,6 @@ impl<'input> InOutFuncs for TimebucketAggregate<'input> {
     }
 }
 
-//equivalent to
-//pub struct TimebucketAggregate {
-//     typ: pg_sys::Oid,
-//     len: u32,
-//     times: [TimestampTz; self.len],
-//     nulls: [u64; div_ceil(len, 64)],
-//     value_offsets: [u32; div_ceil(self.len, 32)],
-//     values: [u8],
-// }
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct TimebucketAggregateHeader {
-    typ: pg_sys::Oid,
-    len: u32,
-}
 
 impl<'input> FromDatum for TimebucketAggregate<'input> {
     unsafe fn from_datum(datum: Datum, is_null: bool, _: pg_sys::Oid) -> Option<Self>
@@ -591,48 +520,16 @@ impl<'input> FromDatum for TimebucketAggregate<'input> {
         }
 
         let ptr = pg_sys::pg_detoast_datum_packed(datum as *mut pg_sys::varlena);
-        let mut data_len = varsize_any_exhdr(ptr);
+        let data_len = varsize_any(ptr);
+        let bytes = slice::from_raw_parts(ptr as *mut u8, data_len);
 
-        let mut data_ptr = vardata_any(ptr);
-        let header_ptr = data_ptr as *mut TimebucketAggregateHeader;
-        let header_size = size_of::<TimebucketAggregateHeader>();
-        let header = *header_ptr;
-
-        data_ptr = data_ptr.add(header_size);
-        data_len = data_len.checked_sub(header_size).unwrap();
-        let times_ptr = data_ptr as *mut TimestampTz as *const TimestampTz;
-        let num_timestamps = header.len as usize;
-        let times_size = num_timestamps * size_of::<TimestampTz>();
-        let times = slice::from_raw_parts(times_ptr, num_timestamps);
-
-        data_ptr = data_ptr.add(times_size);
-        data_len = data_len.checked_sub(times_size).unwrap();
-        let nulls_ptr = data_ptr as *mut u64 as *const u64;
-        let num_nulls = div_ceil(num_timestamps, 64);
-        let nulls_size = num_nulls * size_of::<u64>();
-        let nulls = slice::from_raw_parts(nulls_ptr, num_nulls);
-
-        data_ptr = data_ptr.add(nulls_size);
-        data_len = data_len.checked_sub(nulls_size).unwrap();
-        let offsets_ptr = data_ptr as *mut u32 as *const u32;
-        let num_offsets = if header.len % 2 == 0 {
-                header.len
-            } else {
-                header.len + 1
-            } as usize;
-        let offsets_size = num_offsets * size_of::<u32>();
-        let offsets = slice::from_raw_parts(offsets_ptr, num_offsets);
-
-        data_ptr = data_ptr.add(offsets_size);
-        data_len = data_len.checked_sub(offsets_size).unwrap();
-        let values = slice::from_raw_parts(data_ptr as *mut u8 as *const u8, data_len);
+        let (start, values) = match tba_start::try_ref(bytes) {
+            Ok(wrapped) => wrapped,
+            Err(e) => error!("invalid TimebucketAggregate {:?}", e),
+        };
 
         TimebucketAggregate {
-            base: ptr,
-            typ: header.typ,
-            times,
-            nulls,
-            value_offsets: offsets,
+            start,
             values,
         }.into()
     }
@@ -640,7 +537,7 @@ impl<'input> FromDatum for TimebucketAggregate<'input> {
 
 impl<'input> IntoDatum for TimebucketAggregate<'input> {
     fn into_datum(self) -> Option<Datum> {
-        Some(self.base as Datum)
+        Some(self.start.header as *const u32 as Datum)
     }
 
     fn type_oid() -> pg_sys::Oid {
@@ -709,7 +606,7 @@ impl DatumIo {
         len
     }
 
-    pub fn write<'b>(&self, val: Datum, buffer: &'b mut [u8]) -> (&'b mut [u8], usize) {
+    pub fn write<'b>(&self, val: Datum, buffer: &mut Vec<u8>) -> usize {
         unsafe {
             let mut len;
             let byte_arr;
@@ -721,8 +618,7 @@ impl DatumIo {
                 bytes = &byte_arr[..len];
             } else if self.typlen == -1 {
                 len = varsize(val as *mut _);
-                bytes =  slice::from_raw_parts(val as *mut _, len);
-                (&mut buffer[..len]).copy_from_slice(bytes);
+                bytes = slice::from_raw_parts(val as *mut _, len);
             } else if self.typlen == -2 {
                 len = pg_sys::strlen(val as *const _) as usize + 1;
                 bytes = slice::from_raw_parts(val as *mut _, len);
@@ -731,11 +627,13 @@ impl DatumIo {
                 bytes = slice::from_raw_parts(val as *mut _, len);
             }
 
-            (&mut buffer[..len]).copy_from_slice(bytes);
+            buffer.extend_from_slice(bytes);
             if len % self.needed_alignment() != 0 {
+                let needed = len % self.needed_alignment();
+                buffer.extend((0..needed).map(|_| 0));
                 len += len % self.needed_alignment()
             }
-            (&mut (*buffer)[len..], len)
+            len
         }
     }
 }

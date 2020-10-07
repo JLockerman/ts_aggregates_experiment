@@ -18,6 +18,15 @@ pgx = "0.0.15"
 pgx-macros = "0.0.15"
 serde = "1.0.114"
 
+[dependencies.flat_serialize]
+git = "https://github.com/JLockerman/flat_serialize"
+rev = "da5a558"
+
+[dependencies.flat_serialize_macro]
+git = "https://github.com/JLockerman/flat_serialize"
+rev = "da5a558"
+
+
 [dev-dependencies]
 pgx-tests = "0.0.15"
 
